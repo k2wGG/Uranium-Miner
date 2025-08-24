@@ -2,8 +2,13 @@
 /**
  * bin/start.cjs — модульная архитектура + refinery + headless через аргументы/ENV.
  * Без дублирования логики — всё делегируется в src/core/*
+ * Добавлено:
+ *   • Жёсткая нормализация startUrl (fix Page.navigate params)
+ *   • Единая стратегия выбора proxy: CLI → profile.proxy → profile.proxies[] → data/proxies.txt
+ *   • Лёгкие ретраи возврата на главную после reload
  */
 
+const fs = require('fs/promises');
 const path = require('path');
 const minimist = require('minimist');
 
@@ -58,9 +63,45 @@ async function gotoHomeSafe(page, url, label='главную') {
   try {
     await gotoIfNeeded(page, target, label);
   } catch (e) {
-    log(`WRN gotoIfNeeded(${target}) → ${e.message}. Повтор с ${DEFAULT_URL}`,'warn');
+    log(`WRN gotoIfNeeded(${target}) → ${e.message}. Повтор с ${DEFAULT_URL}`, 'warn');
     await gotoIfNeeded(page, DEFAULT_URL, label);
   }
+}
+
+async function readProxiesTxt() {
+  try {
+    const file = path.resolve(process.cwd(), 'data', 'proxies.txt');
+    const raw = await fs.readFile(file, 'utf8');
+    return raw.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function pickFrom(arr) {
+  if (!Array.isArray(arr) || !arr.length) return '';
+  return arr[Math.floor(Math.random() * arr.length)];
+}
+
+/**
+ * Единая стратегия выбора прокси:
+ * 1) CLI: --proxy
+ * 2) Профиль: config.proxy (string)
+ * 3) Профиль: config.proxies[] (random)
+ * 4) Общая:  data/proxies.txt (random)
+ */
+async function resolveProxy(argv, config) {
+  if (argv.proxy && String(argv.proxy).trim()) return String(argv.proxy).trim();
+  if (config.proxy && String(config.proxy).trim()) return String(config.proxy).trim();
+
+  if (Array.isArray(config.proxies) && config.proxies.length) {
+    const pick = pickFrom(config.proxies.map(String).map(s => s.trim()).filter(Boolean));
+    if (pick) return pick;
+  }
+
+  const fromFile = await readProxiesTxt();
+  const pick = pickFrom(fromFile);
+  return pick || '';
 }
 
 /* ───────────── main ───────────── */
@@ -71,13 +112,24 @@ async function gotoHomeSafe(page, url, label='главную') {
   config.startUrl = ensureUrl(config.startUrl || argv.startUrl || DEFAULT_URL);
   log(`Start URL: ${config.startUrl}`, 'info');
 
+  // Разруливаем proxy по приоритетам (см. resolveProxy)
+  try {
+    const chosenProxy = await resolveProxy(argv, config);
+    if (chosenProxy && chosenProxy !== config.proxy) {
+      log(`Using proxy (resolved): ${chosenProxy}`, 'info');
+    }
+    config.proxy = chosenProxy || ''; // puppeteer.cjs сам залогирует валидность
+  } catch (e) {
+    log(`WRN proxy resolve failed: ${e.message}`, 'warn');
+  }
+
   // Пробрасываем флаги в модули
   setClientFlags({ showClientLogs: config.showClientLogs });
   setReloadConfig({ rotateProxyOnReload: config.rotateProxyOnReload, reloadSec: config.reloadSec });
 
   // Грейсфул-выход
   async function gracefulExit(code=0) {
-    try { await saveAll(config, stats); } catch(e){ log(`saveAll: ${e.message}`,'warn'); }
+    try { await saveAll(config, stats); } catch(e){ log(`saveAll: ${e.message}`, 'warn'); }
     cancelReloadTimer();
     await closeBrowser();
     process.exit(code);
@@ -95,14 +147,14 @@ async function gotoHomeSafe(page, url, label='главную') {
       await waitForUIReady(page);
     } catch (e) {
       // fallback: мягкий ре-энтри
-      log(`WRN waitForUIReady: ${e.message}. Перезаход на главную…`,'warn');
+      log(`WRN waitForUIReady: ${e.message}. Перезаход на главную…`, 'warn');
       await gotoHomeSafe(page, config.startUrl, 'главную');
       await waitForUIReady(page);
     }
     try {
       await waitForMineReady(page);
     } catch (e) {
-      log(`WRN waitForMineReady: ${e.message}. Ещё раз обновим главную…`,'warn');
+      log(`WRN waitForMineReady: ${e.message}. Ещё раз обновим главную…`, 'warn');
       await gotoHomeSafe(page, config.startUrl, 'главную');
       await waitForUIReady(page);
       await waitForMineReady(page);
@@ -116,7 +168,7 @@ async function gotoHomeSafe(page, url, label='главную') {
       await waitForMineReady(page);
     });
 
-    // Контроллер 8-часового /refinery (вся логика внутри модуля)
+    // Контроллер 8-часового /refinery
     const refinery = createRefineryController({
       page,
       cfg: {
@@ -173,13 +225,13 @@ async function gotoHomeSafe(page, url, label='главную') {
       // 3) периодическое сохранение
       if (Date.now() - lastPersistAt > 5*60*1000) {
         try { await saveAll(config, stats); lastPersistAt = Date.now(); }
-        catch(e){ log(`WRN saveAll tick: ${e.message}`,'warn'); }
+        catch(e){ log(`WRN saveAll tick: ${e.message}`, 'warn'); }
       }
 
       await sleep(5000);
     }
   } catch (e) {
-    log(`FATAL: ${e.message}`,'error');
+    log(`FATAL: ${e.message}`, 'error');
     cancelReloadTimer();
     await closeBrowser();
     process.exit(1);

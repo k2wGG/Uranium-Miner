@@ -20,6 +20,9 @@ const IS_WIN = process.platform === 'win32';
 const EMOJI = process.env.FORCE_EMOJI ? true : !IS_WIN;
 const ico = (e, fallback='') => (EMOJI ? e : fallback);
 
+// кеш последнего выбора для «Запустить выбранные»
+let _cachedSelection = [];
+
 function showBanner() {
   console.clear();
   const font = IS_WIN ? 'Standard' : 'ANSI Shadow';
@@ -42,6 +45,21 @@ async function askList({ message, items }) {
     loop: false
   }]);
   return value;
+}
+
+// единый чекбокс-диалог выбора профилей
+async function pickAccounts({ accounts, preselected = [] }) {
+  const { accs } = await inquirer.prompt([{
+    type: 'checkbox',
+    name: 'accs',
+    message: 'Выберите аккаунты:',
+    choices: accounts.map(a => ({ name: a, value: a })),
+    default: preselected,
+    validate: arr => arr.length ? true : 'Нужно выбрать хотя бы один аккаунт',
+    pageSize: Math.max(3, Math.min(accounts.length, 20)),
+    loop: false
+  }]);
+  return accs;
 }
 
 async function mainMenu() {
@@ -118,7 +136,9 @@ async function proxiesMenu() {
 }
 
 async function botsMenu() {
-  const running = listRunning();
+  const accounts = await safeListAccounts();
+  const running  = listRunning();
+
   const value = await askList({
     message: chalk.green('Управление ботами:'),
     items: [
@@ -134,38 +154,41 @@ async function botsMenu() {
   });
 
   if (value === 'startOne') {
-    await startBot(); // интерактивный ввод имени профиля
+    // интерактивный ввод имени профиля внутри startBot()
+    await startBot();
+    return;
   }
 
   if (value === 'startSelected') {
-    const all = await safeListAccounts();
-    if (!all.length) {
+    if (!accounts.length) {
       console.log(chalk.yellow('Нет профилей в ./profiles'));
       return;
     }
-    const { selected } = await inquirer.prompt([{
-      type: 'checkbox',
-      name: 'selected',
-      message: 'Выберите аккаунты для запуска:',
-      choices: all.map(a => ({ name: a, value: a })),
-      validate: (arr) => arr.length ? true : 'Нужно выбрать хотя бы один аккаунт',
-      pageSize: Math.min(all.length, 20),
-      loop: false
-    }]);
-    await startBotsBatch(selected);
+    // если уже выбирали раньше — не спрашиваем повторно
+    const list = _cachedSelection.length
+      ? _cachedSelection
+      : await pickAccounts({ accounts });
+
+    if (!list.length) return;
+    _cachedSelection = list;
+
+    // передаём выбранные напрямую в менеджер
+    await startBotsBatch({ profiles: list });
+    return;
   }
 
   if (value === 'startAll') {
-    const all = await safeListAccounts();
-    if (!all.length) {
+    if (!accounts.length) {
       console.log(chalk.yellow('Нет профилей в ./profiles'));
       return;
     }
-    await startBotsBatch(all);
+    _cachedSelection = [...accounts];
+    await startBotsBatch({ profiles: accounts });
+    return;
   }
 
-  if (value === 'stop')    await stopBot(running);
-  if (value === 'restart') await restartBot(running);
+  if (value === 'stop')    { await stopBot(running); return; }
+  if (value === 'restart') { await restartBot(running); return; }
   if (value === 'ls') {
     console.log(chalk.cyan('Активные:'), running.length ? running.join(', ') : 'нет');
   }
